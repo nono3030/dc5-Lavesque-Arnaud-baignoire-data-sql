@@ -14,6 +14,8 @@ MIN_NET = 147.25                  # credit net minimum accepte, BTC par BTC (neg
 # NB : avec des legs 'delta', MIN_NET est recalcule apres choix des strikes si vous le mettez a None
 START = 1.00                           # prix de depart = START x mark net
 STEP, EVERY, MAX_MIN = 0.01, 120, 25   # baisse de 1 % du mark toutes les 2 min, annule apres 25 min
+MAX_AMOUNT = 0.02                      # garde-fou : taille max par leg, en BTC
+if any(l['amount'] > MAX_AMOUNT + 1e-9 for l in LEGS): raise SystemExit('Taille > %s BTC par leg : refuse.' % MAX_AMOUNT)
 tok = None
 def call(path, params=None, private=False):
     h = {'Authorization': 'Bearer ' + tok} if private else {}
@@ -52,9 +54,13 @@ def resolve():
 resolve()
 credit_mark = net_mark()
 print('Credit net au mark : %.4f (unite du produit) par BTC | plancher accepte : %.4f' % (credit_mark, MIN_NET))
+print('Prix de depart : %.4f (START %.2f) | duree max %d min' % (credit_mark * START, START, MAX_MIN))
+if credit_mark * START < MIN_NET: raise SystemExit('Prix de depart sous le plancher : abandon.')
 if not GO: sys.exit('Dry-run termine, rien envoye.')
-tok = call('public/auth', {'grant_type': 'client_credentials', 'client_id': os.environ['DERIBIT_ID'],
-                           'client_secret': os.environ['DERIBIT_SECRET']})['access_token']
+auth = call('public/auth', {'grant_type': 'client_credentials', 'client_id': os.environ['DERIBIT_ID'],
+                            'client_secret': os.environ['DERIBIT_SECRET']})
+tok = auth['access_token']
+if auth['expires_in'] < MAX_MIN * 60 + 120: raise SystemExit('Jeton valide %s s seulement, trop court pour %d min : abandon.' % (auth['expires_in'], MAX_MIN))
 amount = LEGS[0]['amount']
 if any(abs(l['amount'] - amount) > 1e-9 for l in LEGS): raise SystemExit('Legs de tailles differentes : non supporte.')
 combo = call('private/create_combo', {'trades': [{'instrument_name': l['instrument'],
@@ -80,18 +86,25 @@ oid = call('private/' + cdir, {'instrument_name': cid, 'amount': amount, 'type':
            'label': 'combo-push'}, private=True)['order']['order_id']
 t0 = time.time(); last = t0
 print('Ordre %s a %s (credit %.4f)' % (oid, price, credit))
-while True:
-    time.sleep(10)
-    st = call('private/get_order_state', {'order_id': oid}, private=True)
-    if st['order_state'] == 'filled':
-        print('FILLE a', st.get('average_price')); break
-    if st['order_state'] in ('cancelled', 'rejected'): print('Etat', st['order_state']); break
-    if time.time() - t0 > MAX_MIN * 60:
-        call('private/cancel', {'order_id': oid}, private=True); print('Timeout, ordre annule.'); break
-    if time.time() - last >= EVERY:
-        last = time.time()
-        credit -= abs(credit_mark) * STEP
-        if credit < MIN_NET: print('Plancher atteint, on laisse tourner a', price); continue
-        price = tick_round(to_p(credit), tick)
-        call('private/edit', {'order_id': oid, 'amount': amount, 'price': price}, private=True)
-        print('Reprice -> %s (credit %.4f)' % (price, credit))
+try:
+    while True:
+        time.sleep(10)
+        st = call('private/get_order_state', {'order_id': oid}, private=True)
+        if st['order_state'] == 'filled':
+            print('FILLE a', st.get('average_price')); break
+        if st['order_state'] in ('cancelled', 'rejected'): print('Etat', st['order_state']); break
+        if time.time() - t0 > MAX_MIN * 60:
+            call('private/cancel', {'order_id': oid}, private=True); print('Timeout, ordre annule.'); break
+        if time.time() - last >= EVERY:
+            last = time.time()
+            credit -= abs(credit_mark) * STEP
+            if credit < MIN_NET: print('Plancher atteint, on laisse tourner a', price); continue
+            price = tick_round(to_p(credit), tick)
+            call('private/edit', {'order_id': oid, 'amount': amount, 'price': price}, private=True)
+            print('Reprice -> %s (credit %.4f)' % (price, credit))
+except BaseException:  # erreur Deribit, reseau ou Ctrl+C : on ne laisse pas l'ordre seul dans le carnet
+    try:
+        call('private/cancel', {'order_id': oid}, private=True); print('Interruption : ordre', oid, 'annule.')
+    except BaseException as e:
+        print('ATTENTION : ordre', oid, 'peut-etre encore ouvert ->', e)
+    raise
