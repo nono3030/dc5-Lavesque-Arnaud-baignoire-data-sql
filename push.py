@@ -10,8 +10,7 @@ LIVE = '--live' in sys.argv; GO = '--go' in sys.argv
 BASE = 'https://www.deribit.com' if (LIVE or not GO) else 'https://test.deribit.com'  # dry-run : lecture des vrais prix
 LEGS = json.loads('''[{"type":"P","expiry":"20OCT26","delta":0.2,"direction":"sell","amount":0.02},{"type":"C","expiry":"20OCT26","delta":0.2,"direction":"sell","amount":0.02}]''')      # legs voulus ; 'delta' au lieu de 'instrument' = strike choisi dans la chaine live
 PROD = 'BTC_USDC'                      # 'BTC' (options coin-margined) ou 'BTC_USDC' (options USDC)
-MIN_NET = 147.25                  # credit net minimum accepte, BTC par BTC (negatif = debit max), meme unite que les prix du produit
-# NB : avec des legs 'delta', MIN_NET est recalcule apres choix des strikes si vous le mettez a None
+FLOOR = 0.95                           # plancher = FLOOR x mark net, recalcule au lancement puis a chaque repricing
 START = 1.00                           # prix de depart = START x mark net
 STEP, EVERY, MAX_MIN = 0.01, 120, 25   # baisse de 1 % du mark toutes les 2 min, annule apres 25 min
 MAX_AMOUNT = 0.02                      # garde-fou : taille max par leg, en BTC
@@ -53,6 +52,7 @@ def resolve():
         print('  delta cible %.2f -> %s (delta %.3f, IV %.1f, OI %s)' % (l['delta'], best[1], best[2], best[3], best[4]))
 resolve()
 credit_mark = net_mark()
+MIN_NET = credit_mark * FLOOR
 print('Credit net au mark : %.4f (unite du produit) par BTC | plancher accepte : %.4f' % (credit_mark, MIN_NET))
 print('Prix de depart : %.4f (START %.2f) | duree max %d min' % (credit_mark * START, START, MAX_MIN))
 if credit_mark * START < MIN_NET: raise SystemExit('Prix de depart sous le plancher : abandon.')
@@ -85,6 +85,7 @@ price = tick_round(to_p(credit), tick)
 oid = call('private/' + cdir, {'instrument_name': cid, 'amount': amount, 'type': 'limit', 'price': price,
            'label': 'combo-push'}, private=True)['order']['order_id']
 t0 = time.time(); last = t0
+n = 0  # nombre de baisses
 print('Ordre %s a %s (credit %.4f)' % (oid, price, credit))
 try:
     while True:
@@ -97,11 +98,16 @@ try:
             call('private/cancel', {'order_id': oid}, private=True); print('Timeout, ordre annule.'); break
         if time.time() - last >= EVERY:
             last = time.time()
-            credit -= abs(credit_mark) * STEP
-            if credit < MIN_NET: print('Plancher atteint, on laisse tourner a', price); continue
-            price = tick_round(to_p(credit), tick)
+            n += 1
+            mark_now = net_mark()
+            floor = mark_now * FLOOR
+            credit = max(mark_now * (START - STEP * n), floor)
+            new = tick_round(to_p(credit), tick)
+            if to_p(new) < floor - 1e-9: new = tick_round(new + (tick if cdir == 'sell' else -tick), tick)  # l'arrondi ne passe jamais sous le plancher
+            if new == price: print('Reprice %d : prix inchange %s (mark %.4f, plancher %.4f)' % (n, price, mark_now, floor)); continue
+            price = new
             call('private/edit', {'order_id': oid, 'amount': amount, 'price': price}, private=True)
-            print('Reprice -> %s (credit %.4f)' % (price, credit))
+            print('Reprice %d -> %s (credit %.4f, mark %.4f, plancher %.4f)' % (n, price, to_p(price), mark_now, floor))
 except BaseException:  # erreur Deribit, reseau ou Ctrl+C : on ne laisse pas l'ordre seul dans le carnet
     try:
         call('private/cancel', {'order_id': oid}, private=True); print('Interruption : ordre', oid, 'annule.')
